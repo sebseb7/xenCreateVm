@@ -1,0 +1,238 @@
+#!/bin/sh
+
+#
+# todo: set /etc/default/rcS TMPTIME=-1
+#
+# ssh port
+#
+#
+
+
+
+SIZE_OF_ROOTFS_IN_MB=2048         # think ~500 is the minimum for doing a wheezy installation
+SIZE_OF_SWAP_IN_MB=512		 
+SIZE_OF_MEMORY_IN_MB=512		 
+HOSTNAME=XXXXXX           # hostname of the client
+CLIENT_IP=XXX.YYY.ZZZ.AAA
+CLIENT_NETMASK=255.255.255.XXX
+CLIENT_NETWORK=XXX.YYY.ZZZ.AAA 
+CLIENT_BROADCAST=XXX.YYY.ZZZ.AAA
+CLIENT_GATEWAY=XXX.YYY.ZZZ.AAA
+CLIENT_DOMAIN=XXX.YY
+CLIENT_DNS1=8.8.8.8
+CLIENT_DNS2=8.8.4.4
+MAIL_RELEAY=XXX.YY/MX		 # the mailserver all mail will go through
+MAIL_ALIAS=XXX@YYY.ZZ          # wo will receive root's mails 
+DEBIAN_MIRROR=http://ftp.de.debian.org/debian/ # the nearest debian mirror
+
+
+############################################################
+
+unset LANG
+
+if [ -d $HOSTNAME ] ;then
+    echo "already exists"
+    exit
+fi
+
+if [ "$USER" != root ] ;then
+    echo "this script will now change to root, enter root pwd here: "
+    su -c $0
+    exit
+fi
+
+# create a directory which houses everything
+mkdir $HOSTNAME ||  exit 1
+cd $HOSTNAME
+
+# create the filesystem
+dd if=/dev/zero of=rootfs_${HOSTNAME} bs=1M count=$SIZE_OF_ROOTFS_IN_MB  ||  exit 1
+dd if=/dev/zero of=swap_${HOSTNAME} bs=1M count=$SIZE_OF_SWAP_IN_MB  ||  exit 1
+mkfs.ext4 -F -q rootfs_${HOSTNAME} ||  exit 1
+mkswap -f swap_${HOSTNAME} ||  exit 1
+
+#mount it via loopback
+mkdir tmp  ||  exit 1
+mount rootfs_${HOSTNAME} tmp -o loop ||  exit 1
+
+
+#install basic debian system
+debootstrap  --variant=minbase --include=rsyslog,psmisc,wget,apt-show-versions,arping,deborphan,dialog,exim4-daemon-light,file,git-core,ifupdown,iputils-ping,less,libc6-xen,locales,man-db,mc,net-tools,openssh-server,vim-nox wheezy tmp $DEBIAN_MIRROR ||  exit 1
+
+
+cat << _EOF_ > tmp/etc/fstab
+/dev/xvda1 / ext4 noatime,nodiratime,errors=remount-ro 0 1
+/dev/xvda2 none swap defaults 0 0
+proc /proc proc defaults 0 0
+_EOF_
+
+
+# set the hostname
+echo $HOSTNAME > tmp/etc/hostname
+
+# set the mailname
+echo $HOSTNAME > tmp/etc/mailname
+
+	
+# create inittab
+cat << _EOF_ > tmp/etc/inittab
+id:2:initdefault:
+si::sysinit:/etc/init.d/rcS
+~~:S:wait:/sbin/sulogin
+l0:0:wait:/etc/init.d/rc 0
+l1:1:wait:/etc/init.d/rc 1
+l2:2:wait:/etc/init.d/rc 2
+l3:3:wait:/etc/init.d/rc 3
+l4:4:wait:/etc/init.d/rc 4
+l5:5:wait:/etc/init.d/rc 5
+l6:6:wait:/etc/init.d/rc 6
+z6:6:respawn:/sbin/sulogin
+1:2345:respawn:/sbin/getty 38400 hvc0
+_EOF_
+												
+
+# create network configuration
+cat << _EOF_ > tmp/etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+    address $CLIENT_IP
+    netmask $CLIENT_NETMASK
+    network $CLIENT_NETWORK
+    broadcast $CLIENT_BROADCAST
+    gateway $CLIENT_GATEWAY
+    post-up /usr/sbin/arping -c 1 -S $CLIENT_IP $CLIENT_GATEWAY
+_EOF_
+cat << _EOF_ > tmp/etc/resolv.conf
+nameserver $CLIENT_DNS1
+nameserver $CLIENT_DNS2
+search $CLIENT_DOMAIN
+_EOF_
+echo "$CLIENT_IP $HOSTNAME ${HOSTNAME}.${CLIENT_DOMAIN}" > tmp/etc/hosts
+echo "127.0.0.1	localhost" >> tmp/etc/hosts
+
+
+# setup mail
+cat << _EOF_ > tmp/etc/exim4/update-exim4.conf.conf
+dc_eximconfig_configtype='satellite'
+dc_other_hostnames='${HOSTNAME}.${CLIENT_DOMAIN}'
+dc_local_interfaces='127.0.0.1'
+dc_readhost='exse.net'
+dc_relay_domains=''
+dc_minimaldns='false'
+dc_relay_nets=''
+dc_smarthost='$MAIL_RELEAY'
+CFILEMODE='644'
+dc_use_split_config='false'
+dc_hide_mailname='false'
+dc_mailname_in_oh='true'                                                                                        
+dc_localdelivery='mail_spool'
+_EOF_
+
+
+
+echo "root: $MAIL_ALIAS" >> tmp/etc/aliases
+chroot tmp /usr/sbin/update-exim4.conf
+
+echo "Europe/Berlin" > tmp/etc/timezone
+
+
+cat << _EOF_ > tmp/etc/apt/sources.list
+
+deb $DEBIAN_MIRROR wheezy main
+deb http://ftp.de.debian.org/debian wheezy-updates main
+deb http://ftp.de.debian.org/debian-security wheezy/updates main
+
+_EOF_
+
+cat << _EOF_ >> tmp/etc/apt/apt.conf.d/10minimal
+APT::Install-Recommends "0";
+APT::Install-Suggests "0";
+_EOF_
+
+
+chroot tmp update-locale LANG=en_US.UTF-8
+echo "en_US.UTF-8 UTF-8" > tmp/etc/locale.gen
+chroot tmp locale-gen
+
+
+
+# update the packagelist
+chroot tmp apt-get update
+chroot tmp apt-get -y upgrade
+chroot tmp apt-get clean
+
+
+# initialize apt-show-version
+chroot tmp apt-show-versions -i
+
+# set the password for the xen
+echo "Enter Root Password for your new xen Virtual Host"
+chroot tmp passwd
+
+# unmoust the filesystem, we're finished with it
+umount tmp
+
+rmdir tmp
+
+cat << _EOF_ > start.sh
+#!/bin/sh
+cd \`dirname $0\`
+if [ -f hibernate_file ];then
+    echo "cannot start. is suspended !"
+    exit
+fi
+
+/usr/sbin/xm create config_${HOSTNAME}
+_EOF_
+cat << _EOF_ > stop.sh
+#!/bin/sh
+cd \`dirname $0\`
+if [ -f hibernate_file ];then
+    echo "cannot stop. is suspended !"
+    exit
+fi
+
+xm shutdown $HOSTNAME
+xm console $HOSTNAME
+_EOF_
+cat << _EOF_ > suspend.sh
+#!/bin/sh
+cd \`dirname $0\`
+if [ -f hibernate_file ];then
+    echo "cannot suspend. is suspended !"
+    exit
+fi
+
+xm save $HOSTNAME hibernate_file
+_EOF_
+cat << _EOF_ > resume.sh
+#!/bin/sh
+cd \`dirname $0\`
+xm restore hibernate_file
+rm hibernate_file
+_EOF_
+chmod +x suspend.sh
+chmod +x resume.sh
+chmod +x start.sh
+chmod +x stop.sh
+chmod +x start.sh
+
+cat << _EOF_ > config_$HOSTNAME
+disk=['file:/opt/xen/${HOSTNAME}/rootfs_${HOSTNAME},xvda1,w','file:/opt/xen/${HOSTNAME}/swap_${HOSTNAME},xvda2,w']
+#disk=['tap:aio:/opt/xen/${HOSTNAME}/rootfs_${HOSTNAME},sda1,w','tap:aio:/opt/xen/${HOSTNAME}/swap_${HOSTNAME},sda2,w']
+kernel = "/boot/vmlinuz-3.2.0-4-686-pae";
+ramdisk = "/boot/initrd.img-3.2.0-4-686-pae"
+#kernel = "/opt/xen/kernels/default";
+name="${HOSTNAME}"
+vif=['']
+vcpus=1
+extra="console=hvc0 xencons=tty"
+memory=${SIZE_OF_MEMORY_IN_MB}
+root="/dev/xvda1 ro"
+_EOF_
+
+cd ..
+
